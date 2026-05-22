@@ -37,23 +37,32 @@ const { Readable } = require('stream');
 
 const router = express.Router();
 
+/**
+ * Dispatch table for refreshing signed file URLs by storage source.
+ * Adding a new provider only requires another entry here.
+ */
+const fileUrlRefreshBySource = {
+  [FileSources.s3]: {
+    cacheKey: CacheKeys.S3_EXPIRY_INTERVAL,
+    refreshFiles: refreshS3FileUrls,
+  },
+  [FileSources.azure_blob]: {
+    cacheKey: CacheKeys.AZURE_EXPIRY_INTERVAL,
+    refreshFiles: refreshAzureFileUrls,
+  },
+};
+
 router.get('/', async (req, res) => {
   try {
     const appConfig = req.config;
     const files = await getFiles({ user: req.user.id });
-    if (appConfig.fileStrategy === FileSources.s3 || appConfig.fileStrategy === FileSources.azure_blob) {
+    const refresher = fileUrlRefreshBySource[appConfig.fileStrategy];
+    if (refresher) {
       try {
-        const cacheKey = appConfig.fileStrategy === FileSources.s3 
-          ? CacheKeys.S3_EXPIRY_INTERVAL 
-          : CacheKeys.AZURE_EXPIRY_INTERVAL;
-        const cache = getLogStores(cacheKey);
+        const cache = getLogStores(refresher.cacheKey);
         const alreadyChecked = await cache.get(req.user.id);
         if (!alreadyChecked) {
-          if (appConfig.fileStrategy === FileSources.s3) {
-            await refreshS3FileUrls(files, batchUpdateFiles);
-          } else {
-            await refreshAzureFileUrls(files, batchUpdateFiles);
-          }
+          await refresher.refreshFiles(files, batchUpdateFiles);
           const cacheTime = getFileURLRefreshCacheTime(appConfig.fileStrategy);
           await cache.set(req.user.id, true, cacheTime);
         }

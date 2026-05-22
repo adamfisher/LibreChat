@@ -8,10 +8,21 @@ const { FileSources } = require('librechat-data-provider');
 const { getAzureContainerClient, deleteRagFile } = require('@librechat/api');
 
 const defaultBasePath = 'images';
-const { AZURE_STORAGE_PUBLIC_ACCESS = 'true', AZURE_CONTAINER_NAME = 'files' } = process.env;
-const { BlobSASPermissions, generateBlobSASQueryParameters, StorageSharedKeyCredential } = require('@azure/storage-blob');
+const { AZURE_CONTAINER_NAME = 'files' } = process.env;
+// Read AZURE_STORAGE_PUBLIC_ACCESS off process.env at call time, not module-load
+// time, so runtime env changes (and tests that toggle the flag via beforeEach)
+// are honored. Default is `false` — never silently open public containers.
+const isPublicAccess = () => process.env.AZURE_STORAGE_PUBLIC_ACCESS?.toLowerCase() === 'true';
+const {
+  BlobServiceClient,
+  BlobSASPermissions,
+  SASProtocol,
+  generateBlobSASQueryParameters,
+  StorageSharedKeyCredential,
+} = require('@azure/storage-blob');
 
-let azureUrlExpirySeconds = 2 * 60;
+const DEFAULT_AZURE_URL_EXPIRY_SECONDS = 5 * 60;
+let azureUrlExpirySeconds = DEFAULT_AZURE_URL_EXPIRY_SECONDS;
 let azureRefreshExpiryMs = null;
 
 let userDelegationKey = null;
@@ -24,20 +35,18 @@ if (process.env.AZURE_URL_EXPIRY_SECONDS !== undefined) {
     azureUrlExpirySeconds = Math.min(parsed, 7 * 24 * 60 * 60);
   } else {
     logger.warn(
-      `[Azure] Invalid AZURE_URL_EXPIRY_SECONDS value: "${process.env.AZURE_URL_EXPIRY_SECONDS}". Using 2-minute expiry.`,
+      `[Azure] Invalid AZURE_URL_EXPIRY_SECONDS value: "${process.env.AZURE_URL_EXPIRY_SECONDS}". Using ${DEFAULT_AZURE_URL_EXPIRY_SECONDS}-second expiry.`,
     );
   }
 }
 
-if (process.env.AZURE_REFRESH_EXPIRY_MS !== null && process.env.AZURE_REFRESH_EXPIRY_MS) {
+if (process.env.AZURE_REFRESH_EXPIRY_MS) {
   const parsed = parseInt(process.env.AZURE_REFRESH_EXPIRY_MS, 10);
   if (!isNaN(parsed) && parsed > 0) {
     azureRefreshExpiryMs = parsed;
     logger.info(`[Azure] Using custom refresh expiry time: ${azureRefreshExpiryMs}ms`);
   }
 }
-
-const isPublicAccess = () => AZURE_STORAGE_PUBLIC_ACCESS?.toLowerCase() === 'true';
 
 /**
  * Obtains and caches a User Delegation Key from Azure Blob Storage for use with
@@ -83,11 +92,6 @@ async function getSignedAzureURL({ blobPath, containerName = AZURE_CONTAINER_NAM
     const connectionString = process.env.AZURE_STORAGE_CONNECTION_STRING;
     const accountName = process.env.AZURE_STORAGE_ACCOUNT_NAME;
 
-    // BlobServiceClient is loaded dynamically to allow optional Azure SDK installation.
-    // BlobSASPermissions, generateBlobSASQueryParameters, and StorageSharedKeyCredential
-    // are imported at the top of the module and reused here.
-    const { BlobServiceClient } = await import('@azure/storage-blob');
-
     const startsOn = new Date();
     const expiresOn = new Date(startsOn.getTime() + azureUrlExpirySeconds * 1000);
 
@@ -100,8 +104,12 @@ async function getSignedAzureURL({ blobPath, containerName = AZURE_CONTAINER_NAM
       const keyMatch = connectionString.match(/AccountKey=([^;]+)/i);
 
       if (!match || !keyMatch) {
-        logger.warn('[getSignedAzureURL] Connection string missing AccountName or AccountKey, returning unsigned URL');
-        return blockBlobClient.url;
+        // Fail loud: a connection string without AccountName/AccountKey cannot
+        // produce a signed URL. Returning the unsigned URL here would be a silent
+        // security regression — callers expect a SAS when private access is on.
+        throw new Error(
+          '[getSignedAzureURL] AZURE_STORAGE_CONNECTION_STRING is missing AccountName or AccountKey; cannot generate a SAS token',
+        );
       }
 
       const sharedKeyCredential = new StorageSharedKeyCredential(match[1], keyMatch[1]);
@@ -111,6 +119,7 @@ async function getSignedAzureURL({ blobPath, containerName = AZURE_CONTAINER_NAM
           containerName,
           blobName: blobPath,
           permissions: BlobSASPermissions.parse('r'),
+          protocol: SASProtocol.Https,
           startsOn,
           expiresOn,
         },
@@ -138,6 +147,7 @@ async function getSignedAzureURL({ blobPath, containerName = AZURE_CONTAINER_NAM
             containerName,
             blobName: blobPath,
             permissions: BlobSASPermissions.parse('r'),
+            protocol: SASProtocol.Https,
             startsOn,
             expiresOn,
           },
@@ -237,8 +247,16 @@ async function saveURLToAzure({
  */
 async function getAzureURL({ fileName, basePath = defaultBasePath, userId, containerName }) {
   try {
-    const containerClient = await getAzureContainerClient(containerName);
     const blobPath = userId ? `${basePath}/${userId}/${fileName}` : `${basePath}/${fileName}`;
+    // Mirror getS3URL: when private access is on, return a SAS URL — never a
+    // plain blob URL that won't work for the caller. The previous behavior was
+    // a silent break: `processFileURL` persists this URL as the file's filepath,
+    // so URL-based uploads (avatars, image generation outputs) ended up with
+    // unsigned filepaths that 401'd until the next refresh cycle.
+    if (!isPublicAccess()) {
+      return await getSignedAzureURL({ blobPath, containerName });
+    }
+    const containerClient = await getAzureContainerClient(containerName);
     const blockBlobClient = containerClient.getBlockBlobClient(blobPath);
     return blockBlobClient.url;
   } catch (error) {
@@ -259,7 +277,15 @@ async function deleteFileFromAzure(req, file) {
 
   try {
     const containerClient = await getAzureContainerClient(AZURE_CONTAINER_NAME);
-    const blobPath = file.filepath.split(`${AZURE_CONTAINER_NAME}/`)[1];
+    // Use the URL-aware extractor instead of `String.split(containerName + '/')`.
+    // The split-based approach breaks once filepaths carry SAS tokens (the
+    // query string ends up concatenated into the blob name) and on path-style
+    // URLs (Azurite). The extractor parses with `new URL()` so the SAS is
+    // discarded and the container is matched as a path segment.
+    const blobPath = extractBlobPathFromAzureUrl(file.filepath, AZURE_CONTAINER_NAME);
+    if (!blobPath) {
+      throw new Error(`[deleteFileFromAzure] Unable to extract blob path from: ${file.filepath}`);
+    }
     if (!blobPath.includes(req.user.id)) {
       throw new Error('User ID not found in blob path');
     }
@@ -450,21 +476,42 @@ function needsRefreshAzure(signedUrl, bufferSeconds) {
 /**
  * Extracts the blob path from an Azure Blob Storage URL.
  *
- * For a URL of the form `https://<account>.blob.core.windows.net/<container>/<blobPath>`,
- * this function returns the `<blobPath>` portion, or `null` if it cannot be determined.
+ * Handles both:
+ * - Virtual-hosted-style: `https://<account>.blob.core.windows.net/<container>/<blobPath>`
+ * - Path-style / emulator: `https://<host>/<account>/<container>/<blobPath>`
+ *   (used by Azurite, where URLs look like `http://127.0.0.1:10000/devstoreaccount1/<container>/<path>`)
+ *
+ * The container name is used as an anchor: everything after the first path segment
+ * matching the configured container is treated as the blob path. This avoids the bug
+ * where stripping the first segment blindly would yield `<container>/<blobPath>` for
+ * emulator URLs (leaking the container name into the blob path).
  *
  * @param {string} fileUrl - The full Azure Blob Storage URL of the file.
+ * @param {string} [containerName] - The container name to anchor on. Defaults to
+ *   the value of `AZURE_CONTAINER_NAME` (read at call time, fallback `'files'`).
  * @returns {string | null} The blob path within the container, or `null` on failure.
  */
-function extractBlobPathFromAzureUrl(fileUrl) {
+function extractBlobPathFromAzureUrl(fileUrl, containerName) {
   try {
     const url = new URL(fileUrl);
-    const pathname = url.pathname;
-    const parts = pathname.split('/').filter(Boolean);
+    const parts = url.pathname.split('/').filter(Boolean);
     if (parts.length < 2) {
       return null;
     }
-    return parts.slice(1).join('/');
+    const container = containerName ?? process.env.AZURE_CONTAINER_NAME ?? 'files';
+    const containerIdx = parts.indexOf(container);
+    if (containerIdx === -1 || containerIdx === parts.length - 1) {
+      // Container segment not found (or it's the last segment with no blob path
+      // after it). Fall back to the legacy "strip first segment" behavior so URLs
+      // generated before this helper existed (or under a container name that has
+      // since changed) still resolve to *something* — but log it loudly so the
+      // misconfiguration is visible.
+      logger.warn(
+        `[extractBlobPathFromAzureUrl] Container "${container}" not found in URL path "${url.pathname}"; falling back to legacy extraction`,
+      );
+      return parts.slice(1).join('/') || null;
+    }
+    return parts.slice(containerIdx + 1).join('/');
   } catch (error) {
     logger.error('[extractBlobPathFromAzureUrl] Error extracting blob path:', error);
     return null;
@@ -486,11 +533,19 @@ async function getNewAzureURL(currentURL) {
     if (!blobPath) {
       return;
     }
-    
+
+    // Mirror the S3 `keyParts.length < 3` guard: our uploaders always write to
+    // `{basePath}/{userId}/{fileName}`, so anything shallower is malformed input
+    // we shouldn't sign or rebuild a URL for.
+    if (blobPath.split('/').length < 3) {
+      logger.warn(`[getNewAzureURL] Unexpected blob path structure: "${blobPath}"`);
+      return;
+    }
+
     if (!isPublicAccess()) {
       return await getSignedAzureURL({ blobPath });
     }
-    
+
     // Return plain URL for public access
     const containerClient = await getAzureContainerClient();
     const blockBlobClient = containerClient.getBlockBlobClient(blobPath);
